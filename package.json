@@ -1,0 +1,41 @@
+{
+  "name": "fifa-2026-world-cup-widget",
+  "version": "1.0.0",
+  "description": "A premium glassmorphic Windows desktop widget for today's FIFA 2026 World Cup matches.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder --win portable"
+  },
+  "keywords": [
+    "fifa",
+    "world-cup",
+    "widget",
+    "electron"
+  ],
+  "author": "Antigravity Pair",
+  "license": "ISC",
+  "devDependencies": {
+    "electron": "^29.3.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.fifa2026.widget",
+    "win": {
+      "target": "portable",
+      "requestedExecutionLevel": "asInvoker"
+    },
+    "files": [
+      "index.html",
+      "styles.css",
+      "app.js",
+      "main.js",
+      "preload.js",
+      "package.json"
+    ],
+    "directories": {
+      "output": "dist"
+    }
+  }
+}
