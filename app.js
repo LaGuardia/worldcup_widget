@@ -224,6 +224,13 @@ let currentLayout = "horizontal"; // "horizontal" or "vertical"
 let activeTimezone = "PST";        // "PST" or "ET"
 let selectedMatchId = null;       // For the Details modal
 
+let apiMatches = [];
+let apiTeams = {};
+const previousScores = {}; // To detect new goals: { matchId: { scoreA, scoreB } }
+const seenGoals = new Set(); // To prevent double overlay triggers for the same goal
+let fetchErrorOccurred = false;
+let errorMessage = "";
+
 // DOM Element Selections
 const widgetContainer = document.getElementById("widget-container");
 const matchesGrid = document.getElementById("matches-grid");
@@ -237,13 +244,31 @@ const modalBodyContent = document.getElementById("modal-body-content");
 const modalCloseBtn = document.getElementById("modal-close-btn");
 const modalBackdrop = document.getElementById("modal-backdrop-blur");
 
+const STADIUMS_MAP = {
+  "1": { name: "Estadio Azteca", location: "Mexico City, MX" },
+  "2": { name: "Estadio Akron", location: "Guadalajara, MX" },
+  "3": { name: "Estadio BBVA", location: "Monterrey, MX" },
+  "4": { name: "AT&T Stadium", location: "Dallas, TX" },
+  "5": { name: "NRG Stadium", location: "Houston, TX" },
+  "6": { name: "GEHA Field at Arrowhead Stadium", location: "Kansas City, MO" },
+  "7": { name: "Mercedes-Benz Stadium", location: "Atlanta, GA" },
+  "8": { name: "Hard Rock Stadium", location: "Miami, FL" },
+  "9": { name: "Gillette Stadium", location: "Boston, MA" },
+  "10": { name: "Lincoln Financial Field", location: "Philadelphia, PA" },
+  "11": { name: "MetLife Stadium", location: "New York/New Jersey" },
+  "12": { name: "BMO Field", location: "Toronto, ON" },
+  "13": { name: "BC Place", location: "Vancouver, BC" },
+  "14": { name: "Lumen Field", location: "Seattle, WA" },
+  "15": { name: "Levi's Stadium", location: "San Francisco, CA" },
+  "16": { name: "SoFi Stadium", location: "Los Angeles, CA" }
+};
+
 // 3. Time Helper Functions
 function formatTimeFromMinutes(minutes, tz) {
   let h = Math.floor(minutes / 60) % 24;
   let m = Math.floor(minutes % 60);
   
   if (tz === "ET") {
-    // Add 3 hours for ET conversion
     h = (h + 3) % 24;
   }
   
@@ -253,122 +278,386 @@ function formatTimeFromMinutes(minutes, tz) {
   return `${displayHour}:${displayMin} ${suffix} ${tz}`;
 }
 
-function convertKickoffToMinutes(kickoffHourPST) {
-  return kickoffHourPST * 60;
-}
-
-function getPSTTimeMinutes() {
-  const now = new Date();
-  const pstString = now.toLocaleString("en-US", { timeZone: "America/Los_Angeles" });
-  const pstDate = new Date(pstString);
-  return pstDate.getHours() * 60 + pstDate.getMinutes();
-}
-
-function getCurrentTimeMinutes() {
-  return getPSTTimeMinutes();
-}
-
-// Check the state of a match based on current real-time clock
-function getMatchState(match) {
-  const simulationTime = getCurrentTimeMinutes();
-  const kickoff = convertKickoffToMinutes(match.kickoffPST);
-  const end = kickoff + match.duration;
+function getKickoffMinutes(localDateStr, stadiumId, targetTz) {
+  if (!localDateStr) return 0;
+  const parts = localDateStr.split(' ');
+  if (parts.length < 2) return 0;
+  const timeParts = parts[1].split(':');
+  const h = parseInt(timeParts[0], 10) || 0;
+  const m = parseInt(timeParts[1], 10) || 0;
   
-  if (simulationTime < kickoff) {
-    return { state: "UPCOMING", kickoffMinutes: kickoff };
-  } else if (simulationTime >= kickoff && simulationTime < end) {
-    return { state: "LIVE", elapsed: Math.floor(simulationTime - kickoff) };
+  const localMinutes = h * 60 + m;
+  
+  let stadiumUtcOffset = -4; // Default to Eastern
+  const sid = String(stadiumId);
+  if (['13', '14', '15', '16'].includes(sid)) {
+    stadiumUtcOffset = -7;
+  } else if (['4', '5', '6'].includes(sid)) {
+    stadiumUtcOffset = -5;
+  } else if (['1', '2', '3'].includes(sid)) {
+    stadiumUtcOffset = -6; // Mexico Central (UTC-6)
   } else {
-    return { state: "FINISHED" };
+    stadiumUtcOffset = -4; // Eastern
   }
+  
+  const targetOffset = targetTz === 'PST' ? -7 : -4;
+  let targetMinutes = localMinutes - (stadiumUtcOffset * 60) + (targetOffset * 60);
+  targetMinutes = (targetMinutes + 1440) % 1440;
+  return targetMinutes;
 }
 
-// Get dynamic match scores & current live minute based on simulation time
-function getMatchLiveState(match) {
-  const { state, elapsed } = getMatchState(match);
-  
-  if (state === "UPCOMING") {
-    return { scoreA: 0, scoreB: 0, timeDisplay: "Upcoming", details: [] };
-  }
-  
-  let scoreA = 0;
-  let scoreB = 0;
-  const occurredEvents = [];
-  
-  // Calculate score by counting goals that occurred at or before the elapsed match minute
-  const matchMinute = state === "FINISHED" ? 999 : elapsed; // Use 999 for finished to match all events
-  
-  // Live matches transition:
-  // Minute 0 to 45: First Half
-  // Minute 45 to 50: Halftime (5 mins)
-  // Minute 50 to 95: Second Half (represents match minutes 46 to 90)
-  let displayMinute = "";
-  let isHalftime = false;
-  
-  if (state === "LIVE") {
-    if (matchMinute < 45) {
-      displayMinute = `${matchMinute + 1}'`;
-    } else if (matchMinute >= 45 && matchMinute < 50) {
-      displayMinute = "HT";
-      isHalftime = true;
-    } else {
-      // Map sim minute to soccer minute: (elapsed - 5)
-      displayMinute = `${Math.min(90, matchMinute - 4)}'`;
-    }
-  } else {
-    displayMinute = "FT";
-  }
-  
-  // Filter events that have happened
-  match.events.forEach(evt => {
-    // Check if the event minute has passed in match time
-    // First Half events (<= 45') happen when elapsed <= 45
-    // Second Half events (> 45') happen when elapsed > 45 + halftime_buffer
-    let eventSimMinute = evt.minute;
-    if (evt.minute > 45) {
-      eventSimMinute = evt.minute + 4; // Shifted due to HT buffer
+// 4. API Fetching and Data Processing
+async function fetchWorldCupData() {
+  try {
+    fetchErrorOccurred = false;
+    errorMessage = "";
+    
+    // Fetch teams first if they aren't loaded yet
+    if (Object.keys(apiTeams).length === 0) {
+      const teamsRes = await fetch("https://worldcup26.ir/get/teams");
+      if (!teamsRes.ok) throw new Error("Failed to fetch teams metadata");
+      const teamsData = await teamsRes.json();
+      if (teamsData && teamsData.teams) {
+        teamsData.teams.forEach(t => {
+          apiTeams[t.id] = t;
+        });
+      }
     }
     
-    if (matchMinute >= eventSimMinute) {
-      occurredEvents.push(evt);
-      if (evt.type === "goal") {
-        scoreA = evt.score[0];
-        scoreB = evt.score[1];
+    // Fetch games
+    const gamesRes = await fetch("https://worldcup26.ir/get/games");
+    if (!gamesRes.ok) throw new Error("Failed to retrieve live scores");
+    const gamesData = await gamesRes.json();
+    if (gamesData && gamesData.games) {
+      apiMatches = gamesData.games;
+    }
+    
+    // Process score changes and trigger overlays
+    detectNewGoals();
+    
+  } catch (error) {
+    console.error("API Fetch Error:", error);
+    fetchErrorOccurred = true;
+    errorMessage = error.message || "Failed to load live match center data. Please check your network connection.";
+  }
+}
+
+function getTodayDateString() {
+  const now = new Date();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  const year = now.getFullYear();
+  return `${month}/${day}/${year}`;
+}
+
+function getTodaysMatches() {
+  const todayStr = getTodayDateString();
+  return apiMatches.filter(m => m.local_date && m.local_date.startsWith(todayStr));
+}
+
+function getApiMatchState(match) {
+  if (match.finished === "TRUE" || match.time_elapsed === "finished" || match.time_elapsed === "Finished") {
+    return "FINISHED";
+  }
+  if (match.time_elapsed === "live" || match.time_elapsed === "HT" || (match.time_elapsed && match.time_elapsed.includes("'"))) {
+    return "LIVE";
+  }
+  return "UPCOMING";
+}
+
+function parseScorers(scorersStr) {
+  if (!scorersStr || scorersStr === 'null' || scorersStr === 'undefined') return [];
+  try {
+    let normalized = scorersStr.replace(/“/g, '"').replace(/”/g, '"');
+    if (normalized.startsWith('{')) {
+      normalized = '[' + normalized.slice(1, -1) + ']';
+    }
+    if (normalized.startsWith('[')) {
+      return JSON.parse(normalized);
+    }
+    // Check if it's a comma-separated list
+    return normalized.split(',').map(s => s.trim().replace(/^["']|["']$/g, ''));
+  } catch (e) {
+    console.error('Error parsing scorers:', e);
+    return scorersStr.replace(/[{}]/g, '').split(',').map(s => s.trim().replace(/^["'“]|["'”]$/g, ''));
+  }
+}
+
+function detectNewGoals() {
+  apiMatches.forEach(match => {
+    const state = getApiMatchState(match);
+    if (state !== "LIVE") return;
+    
+    const id = match.id;
+    const scoreA = parseInt(match.home_score, 10) || 0;
+    const scoreB = parseInt(match.away_score, 10) || 0;
+    
+    const prev = previousScores[id];
+    if (prev) {
+      const diffA = scoreA - prev.scoreA;
+      const diffB = scoreB - prev.scoreB;
+      
+      if (diffA > 0 || diffB > 0) {
+        // Goal scored!
+        const homeName = match.home_team_name_en;
+        const awayName = match.away_team_name_en;
+        
+        let scorerName = "Goal!";
+        let scorerMinute = "Live";
+        
+        const scorersArrayA = parseScorers(match.home_scorers);
+        const scorersArrayB = parseScorers(match.away_scorers);
+        
+        if (diffA > 0 && scorersArrayA.length > 0) {
+          const lastScorer = scorersArrayA[scorersArrayA.length - 1];
+          const parsed = /(.+?)\s+(\d+)'/.exec(lastScorer);
+          if (parsed) {
+            scorerName = parsed[1];
+            scorerMinute = parsed[2];
+          } else {
+            scorerName = lastScorer;
+          }
+        } else if (diffB > 0 && scorersArrayB.length > 0) {
+          const lastScorer = scorersArrayB[scorersArrayB.length - 1];
+          const parsed = /(.+?)\s+(\d+)'/.exec(lastScorer);
+          if (parsed) {
+            scorerName = parsed[1];
+            scorerMinute = parsed[2];
+          } else {
+            scorerName = lastScorer;
+          }
+        }
+        
+        const goalEvent = {
+          player: scorerName,
+          minute: scorerMinute,
+          team: diffA > 0 ? "teamA" : "teamB",
+          score: [scoreA, scoreB]
+        };
+        
+        const mappedMatch = {
+          id: match.id,
+          teamA: { name: homeName },
+          teamB: { name: awayName }
+        };
+        
+        triggerGoalOverlay(mappedMatch, goalEvent);
       }
+    }
+    
+    previousScores[id] = { scoreA, scoreB };
+  });
+}
+
+function getMatchDetails(apiMatch) {
+  const localMatch = MATCHES_DATA.find(lm => 
+    (lm.teamA.name.toLowerCase() === apiMatch.home_team_name_en.toLowerCase() &&
+     lm.teamB.name.toLowerCase() === apiMatch.away_team_name_en.toLowerCase()) ||
+    (lm.teamA.name.toLowerCase() === apiMatch.away_team_name_en.toLowerCase() &&
+     lm.teamB.name.toLowerCase() === apiMatch.home_team_name_en.toLowerCase())
+  );
+  
+  const state = getApiMatchState(apiMatch);
+  const scoreA = parseInt(apiMatch.home_score, 10) || 0;
+  const scoreB = parseInt(apiMatch.away_score, 10) || 0;
+  
+  const homeTeam = apiTeams[apiMatch.home_team_id] || { name_en: apiMatch.home_team_name_en, flag: "" };
+  const awayTeam = apiTeams[apiMatch.away_team_id] || { name_en: apiMatch.away_team_name_en, flag: "" };
+  const stadium = STADIUMS_MAP[apiMatch.stadium_id] || { name: "World Cup Stadium", location: "North America" };
+  
+  const details = {
+    id: apiMatch.id,
+    group: `Group ${apiMatch.group}`,
+    venue: stadium.name,
+    location: stadium.location,
+    teamA: {
+      name: apiMatch.home_team_name_en,
+      flagUrl: homeTeam.flag || `https://flagcdn.com/w80/${(homeTeam.iso2 || "").toLowerCase()}.png`
+    },
+    teamB: {
+      name: apiMatch.away_team_name_en,
+      flagUrl: awayTeam.flag || `https://flagcdn.com/w80/${(awayTeam.iso2 || "").toLowerCase()}.png`
+    },
+    scoreA,
+    scoreB,
+    state,
+    timeDisplay: state === "LIVE" ? (apiMatch.time_elapsed === "live" ? "Live" : apiMatch.time_elapsed) : (state === "FINISHED" ? "FT" : "Upcoming")
+  };
+
+  // Build events list
+  const parsedEvents = [];
+  const scorersA = parseScorers(apiMatch.home_scorers);
+  const scorersB = parseScorers(apiMatch.away_scorers);
+  
+  let currentScoreA = 0;
+  let currentScoreB = 0;
+  
+  const allScoreEvents = [];
+  scorersA.forEach(s => {
+    const match = /(.+?)\s+(\d+)'/.exec(s);
+    if (match) {
+      allScoreEvents.push({ minute: parseInt(match[2], 10), team: "teamA", player: match[1] });
+    } else {
+      allScoreEvents.push({ minute: 45, team: "teamA", player: s });
+    }
+  });
+  scorersB.forEach(s => {
+    const match = /(.+?)\s+(\d+)'/.exec(s);
+    if (match) {
+      allScoreEvents.push({ minute: parseInt(match[2], 10), team: "teamB", player: match[1] });
+    } else {
+      allScoreEvents.push({ minute: 45, team: "teamB", player: s });
     }
   });
   
+  allScoreEvents.sort((a, b) => a.minute - b.minute);
+  allScoreEvents.forEach(e => {
+    if (e.team === "teamA") currentScoreA++;
+    else currentScoreB++;
+    parsedEvents.push({
+      minute: e.minute,
+      type: "goal",
+      team: e.team,
+      player: e.player,
+      assist: "None",
+      score: [currentScoreA, currentScoreB]
+    });
+  });
+
+  if (localMatch) {
+    details.lineups = localMatch.lineups;
+    details.stats = localMatch.stats;
+    const localEventsNonGoals = localMatch.events.filter(e => e.type !== "goal");
+    details.events = [...parsedEvents, ...localEventsNonGoals].sort((a, b) => a.minute - b.minute);
+  } else {
+    details.lineups = generateMockLineups(details.teamA.name, details.teamB.name);
+    details.stats = generateMockStats(state, scoreA, scoreB);
+    details.events = parsedEvents;
+  }
+  
+  return details;
+}
+
+function generateMockLineups(teamAName, teamBName) {
+  const positions = ["GK", "DF", "DF", "DF", "DF", "MF", "MF", "MF", "FW", "FW", "FW"];
+  const getPlayers = (teamName) => {
+    return positions.map((pos, idx) => ({
+      num: idx + 1,
+      name: `${teamName.substring(0, 3).toUpperCase()} Player ${idx + 1}`,
+      pos
+    }));
+  };
   return {
-    scoreA,
-    scoreB,
-    timeDisplay: displayMinute,
-    isHalftime,
-    eventsOccurred: occurredEvents,
-    simMatchMinute: matchMinute
+    teamA: getPlayers(teamAName),
+    teamB: getPlayers(teamBName)
   };
 }
 
-// 4. Render Interface
+function generateMockStats(state, scoreA, scoreB) {
+  if (state === "UPCOMING") {
+    return {
+      possession: [50, 50],
+      shots: [0, 0],
+      shotsOnTarget: [0, 0],
+      fouls: [0, 0],
+      corners: [0, 0]
+    };
+  }
+  const possessionA = 40 + Math.floor(Math.random() * 21);
+  const possessionB = 100 - possessionA;
+  const shotsA = scoreA * 3 + Math.floor(Math.random() * 5) + 3;
+  const shotsB = scoreB * 3 + Math.floor(Math.random() * 5) + 3;
+  const targetA = scoreA + Math.floor(Math.random() * 3) + 1;
+  const targetB = scoreB + Math.floor(Math.random() * 3) + 1;
+  const foulsA = 8 + Math.floor(Math.random() * 8);
+  const foulsB = 8 + Math.floor(Math.random() * 8);
+  const cornersA = 2 + Math.floor(Math.random() * 6);
+  const cornersB = 2 + Math.floor(Math.random() * 6);
+  
+  return {
+    possession: [possessionA, possessionB],
+    shots: [shotsA, shotsB],
+    shotsOnTarget: [targetA, targetB],
+    fouls: [foulsA, foulsB],
+    corners: [cornersA, cornersB]
+  };
+}
+
+// 5. Render Interface
 function renderWidget() {
   matchesGrid.innerHTML = "";
   
-  MATCHES_DATA.forEach(match => {
-    const { state } = getMatchState(match);
-    const { scoreA, scoreB, timeDisplay } = getMatchLiveState(match);
-    const kickoffMinutes = convertKickoffToMinutes(match.kickoffPST);
+  if (fetchErrorOccurred) {
+    matchesGrid.innerHTML = `
+      <div class="error-state" style="grid-column: 1 / -1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 40px; text-align: center; background: rgba(255, 255, 255, 0.05); backdrop-filter: blur(10px); border-radius: 12px; border: 1px solid rgba(239, 68, 68, 0.3); color: var(--text-light);">
+        <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="var(--accent-red)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-bottom: 16px; filter: drop-shadow(0 0 8px rgba(239, 68, 68, 0.5));">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="12" y1="8" x2="12" y2="12"/>
+          <line x1="12" y1="16" x2="12.01" y2="16"/>
+        </svg>
+        <h3 style="font-family: 'Outfit', sans-serif; font-size: 1.25rem; font-weight: 600; margin-bottom: 8px;">404 Error: Failed to Retrieve Live Scores</h3>
+        <p style="font-size: 0.9rem; color: var(--text-dark); max-width: 400px; margin-bottom: 20px;">
+          ${errorMessage}
+        </p>
+        <button id="retry-btn" class="icon-btn" style="padding: 8px 20px; font-size: 0.9rem; border-radius: 8px; font-weight: 500; cursor: pointer; display: flex; align-items: center; gap: 8px; background: var(--accent-blue); color: var(--bg-dark); border: none;">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+          </svg>
+          Retry Connection
+        </button>
+      </div>
+    `;
     
-    // Create card
+    const retryBtn = document.getElementById("retry-btn");
+    if (retryBtn) {
+      retryBtn.addEventListener("click", async () => {
+        matchesGrid.innerHTML = `
+          <div class="loading-state" style="grid-column: 1 / -1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 40px; color: var(--text-light);">
+            <div class="spinner" style="width: 40px; height: 40px; border: 4px solid rgba(255,255,255,0.1); border-top-color: var(--accent-blue); border-radius: 50%; animation: spin 1s linear infinite; margin-bottom: 16px;"></div>
+            <p>Retrying connection to live match center...</p>
+          </div>
+        `;
+        await fetchWorldCupData();
+        renderWidget();
+      });
+    }
+    return;
+  }
+  
+  const todaysMatches = getTodaysMatches();
+  
+  if (todaysMatches.length === 0) {
+    matchesGrid.innerHTML = `
+      <div class="no-matches-state" style="grid-column: 1 / -1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 40px; text-align: center; background: rgba(255, 255, 255, 0.05); backdrop-filter: blur(10px); border-radius: 12px; border: 1px solid rgba(255, 255, 255, 0.1); color: var(--text-light);">
+        <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="var(--text-dark)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="margin-bottom: 16px;">
+          <rect x="3" y="4" width="18" height="18" rx="2" ry="2"/>
+          <line x1="16" y1="2" x2="16" y2="6"/>
+          <line x1="8" y1="2" x2="8" y2="6"/>
+          <line x1="3" y1="10" x2="21" y2="10"/>
+        </svg>
+        <h3 style="font-family: 'Outfit', sans-serif; font-size: 1.25rem; font-weight: 600; margin-bottom: 8px;">No Matches Today</h3>
+        <p style="font-size: 0.9rem; color: var(--text-dark); max-width: 400px;">
+          There are no World Cup matches scheduled for today (${getTodayDateString()}).
+        </p>
+      </div>
+    `;
+    return;
+  }
+  
+  todaysMatches.forEach(apiMatch => {
+    const match = getMatchDetails(apiMatch);
+    const { state, scoreA, scoreB, timeDisplay, teamA, teamB, venue } = match;
+    
     const card = document.createElement("article");
     card.className = `match-card state-${state.toLowerCase()}`;
     card.id = `match-card-${match.id}`;
     card.setAttribute("tabindex", "0");
     card.setAttribute("role", "button");
-    card.setAttribute("aria-label", `${match.teamA.name} versus ${match.teamB.name}, Status: ${state}`);
+    card.setAttribute("aria-label", `${teamA.name} versus ${teamB.name}, Status: ${state}`);
     
-    // Local Time conversion
-    const kickoffTimeStr = formatTimeFromMinutes(kickoffMinutes, activeTimezone);
+    const targetMinutes = getKickoffMinutes(apiMatch.local_date, apiMatch.stadium_id, activeTimezone);
+    const kickoffTimeStr = formatTimeFromMinutes(targetMinutes, activeTimezone);
     
-    // Header
     let statusPillContent = "";
     if (state === "UPCOMING") {
       statusPillContent = `
@@ -402,9 +691,9 @@ function renderWidget() {
         <div class="team-row">
           <div class="team-info">
             <div class="flag-container">
-              <img class="flag-img" src="https://flagcdn.com/w80/${match.teamA.flag}.png" alt="${match.teamA.name} Flag" loading="lazy" />
+              <img class="flag-img" src="${teamA.flagUrl}" onerror="this.src='https://flagcdn.com/w80/un.png';" alt="${teamA.name} Flag" loading="lazy" />
             </div>
-            <span class="team-name">${match.teamA.name}</span>
+            <span class="team-name">${teamA.name}</span>
           </div>
           <span class="team-score ${state !== "UPCOMING" ? "active-score" : ""}" id="score-a-${match.id}">${state !== "UPCOMING" ? scoreA : "-"}</span>
         </div>
@@ -412,32 +701,30 @@ function renderWidget() {
         <div class="team-row">
           <div class="team-info">
             <div class="flag-container">
-              <img class="flag-img" src="https://flagcdn.com/w80/${match.teamB.flag}.png" alt="${match.teamB.name} Flag" loading="lazy" />
+              <img class="flag-img" src="${teamB.flagUrl}" onerror="this.src='https://flagcdn.com/w80/un.png';" alt="${teamB.name} Flag" loading="lazy" />
             </div>
-            <span class="team-name">${match.teamB.name}</span>
+            <span class="team-name">${teamB.name}</span>
           </div>
           <span class="team-score ${state !== "UPCOMING" ? "active-score" : ""}" id="score-b-${match.id}">${state !== "UPCOMING" ? scoreB : "-"}</span>
         </div>
       </div>
       
       <div class="card-footer">
-        <div class="match-venue" title="${match.venue}, ${match.location}">
+        <div class="match-venue" title="${venue}, ${match.location}">
           <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 2px;">
             <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/>
             <circle cx="12" cy="10" r="3"/>
           </svg>
-          ${match.venue}
+          ${venue}
         </div>
         <div class="match-time">${kickoffTimeStr.replace(` ${activeTimezone}`, "")} <span style="font-size: 0.65rem; color: var(--text-dark);">${activeTimezone}</span></div>
       </div>
     `;
     
-    // Add Click listener to open modal
     card.addEventListener("click", () => {
       openMatchDetails(match.id);
     });
     
-    // Keyboard support
     card.addEventListener("keydown", (e) => {
       if (e.key === "Enter" || e.key === " ") {
         e.preventDefault();
@@ -449,41 +736,11 @@ function renderWidget() {
   });
 }
 
-// 5. Goal alert trigger system
-function checkForGoalAlerts(time) {
-  MATCHES_DATA.forEach(match => {
-    const kickoff = convertKickoffToMinutes(match.kickoffPST);
-    const end = kickoff + match.duration;
-    
-    if (time >= kickoff && time < end) {
-      const elapsed = Math.floor(time - kickoff);
-      
-      match.events.forEach(evt => {
-        if (evt.type === "goal") {
-          let eventSimMinute = evt.minute;
-          if (evt.minute > 45) {
-            eventSimMinute = evt.minute + 4; // Shifted HT buffer
-          }
-          
-          const uniqueGoalId = `${match.id}-${evt.minute}-${evt.player}`;
-          
-          // Trigger alert if the time matches the event minute, and we haven't shown it yet
-          if (elapsed === eventSimMinute && !seenGoals.has(uniqueGoalId)) {
-            seenGoals.add(uniqueGoalId);
-            triggerGoalOverlay(match, evt);
-          }
-        }
-      });
-    }
-  });
-}
-
 // Flash banner and trigger confetti animations on goal
 function triggerGoalOverlay(match, event) {
   goalTeamInfo.textContent = `${match.teamA.name.toUpperCase()} ${event.score[0]} - ${event.score[1]} ${match.teamB.name.toUpperCase()}`;
   goalScorer.textContent = `${event.player} (${event.minute}')`;
   
-  // Highlight score flash on card if it's rendered
   const teamScored = event.team === "teamA" ? "a" : "b";
   const scoreElem = document.getElementById(`score-${teamScored}-${match.id}`);
   if (scoreElem) {
@@ -491,18 +748,14 @@ function triggerGoalOverlay(match, event) {
     setTimeout(() => scoreElem.classList.remove("score-flash"), 3000);
   }
 
-  // Visual feedback: Screen Shake on main container
   widgetContainer.classList.add("shake");
   setTimeout(() => widgetContainer.classList.remove("shake"), 800);
   
-  // Show Banner
   goalOverlay.classList.remove("hidden");
   goalOverlay.setAttribute("aria-hidden", "false");
   
-  // Confetti effect
   spawnConfetti();
   
-  // Auto-dismiss after 3.5 seconds
   setTimeout(() => {
     goalOverlay.classList.add("hidden");
     goalOverlay.setAttribute("aria-hidden", "true");
@@ -518,7 +771,6 @@ function spawnConfetti() {
     const piece = document.createElement("div");
     piece.className = "confetti-piece";
     
-    // Random styles
     const color = colors[Math.floor(Math.random() * colors.length)];
     const size = Math.random() * 8 + 6;
     const left = Math.random() * 100;
@@ -543,7 +795,6 @@ function spawnConfetti() {
     
     container.appendChild(piece);
     
-    // Cleanup piece
     setTimeout(() => {
       piece.remove();
     }, (animDuration + animDelay) * 1000);
@@ -576,26 +827,24 @@ function openMatchDetails(matchId) {
 function updateModalContent() {
   if (!selectedMatchId) return;
   
-  const match = MATCHES_DATA.find(m => m.id === selectedMatchId);
-  if (!match) return;
+  const apiMatch = apiMatches.find(m => m.id === selectedMatchId);
+  if (!apiMatch) return;
   
-  const { state } = getMatchState(match);
-  const { scoreA, scoreB, timeDisplay, eventsOccurred, isHalftime } = getMatchLiveState(match);
+  const match = getMatchDetails(apiMatch);
+  const { state, scoreA, scoreB, timeDisplay, teamA, teamB, venue } = match;
   
-  // Keep track of active tab in modal (default to stats, or events if live)
   let activeTab = document.querySelector(".modal-tab-btn.active")?.dataset.tab || "stats";
   
-  // Render structure
   modalBodyContent.innerHTML = `
     <!-- Header info -->
     <div class="modal-header-section">
-      <div class="modal-group-info">${match.group} • ${match.venue}</div>
+      <div class="modal-group-info">${match.group} • ${venue}</div>
       <div class="modal-scoreboard">
         <div class="modal-team">
           <div class="modal-flag">
-            <img class="flag-img" src="https://flagcdn.com/w160/${match.teamA.flag}.png" alt="${match.teamA.name}" />
+            <img class="flag-img" src="${teamA.flagUrl}" onerror="this.src='https://flagcdn.com/w80/un.png';" alt="${teamA.name}" />
           </div>
-          <div class="modal-team-name">${match.teamA.name}</div>
+          <div class="modal-team-name">${teamA.name}</div>
         </div>
         
         <div class="modal-scores">
@@ -606,16 +855,16 @@ function updateModalContent() {
         
         <div class="modal-team">
           <div class="modal-flag">
-            <img class="flag-img" src="https://flagcdn.com/w160/${match.teamB.flag}.png" alt="${match.teamB.name}" />
+            <img class="flag-img" src="${teamB.flagUrl}" onerror="this.src='https://flagcdn.com/w80/un.png';" alt="${teamB.name}" />
           </div>
-          <div class="modal-team-name">${match.teamB.name}</div>
+          <div class="modal-team-name">${teamB.name}</div>
         </div>
       </div>
       
       <div class="modal-status-text state-${state.toLowerCase()}">
         ${state === "LIVE" ? '<span class="live-dot"></span>' : ''}
-        ${state === "UPCOMING" ? `Upcoming • Kickoff at ${formatTimeFromMinutes(match.kickoffPST * 60, activeTimezone)}` : ""}
-        ${state === "LIVE" ? `LIVE • ${isHalftime ? "Halftime" : timeDisplay}` : ""}
+        ${state === "UPCOMING" ? `Upcoming • Kickoff at ${formatTimeFromMinutes(getKickoffMinutes(apiMatch.local_date, apiMatch.stadium_id, activeTimezone), activeTimezone)}` : ""}
+        ${state === "LIVE" ? `LIVE • ${timeDisplay}` : ""}
         ${state === "FINISHED" ? "Full Time" : ""}
       </div>
       
@@ -634,10 +883,10 @@ function updateModalContent() {
     <div class="tab-content ${activeTab === "stats" ? "active" : ""}" id="tab-stats">
       <div class="stats-container">
         ${renderStatRow("Possession", state !== "UPCOMING" ? match.stats.possession[0] : 50, state !== "UPCOMING" ? match.stats.possession[1] : 50, "%")}
-        ${renderStatRow("Shots (Total)", state !== "UPCOMING" ? Math.min(match.stats.shots[0], Math.ceil(match.stats.shots[0] * getProgressRatio(match))) : 0, state !== "UPCOMING" ? Math.min(match.stats.shots[1], Math.ceil(match.stats.shots[1] * getProgressRatio(match))) : 0)}
-        ${renderStatRow("Shots on Target", state !== "UPCOMING" ? Math.min(match.stats.shotsOnTarget[0], Math.ceil(match.stats.shotsOnTarget[0] * getProgressRatio(match))) : 0, state !== "UPCOMING" ? Math.min(match.stats.shotsOnTarget[1], Math.ceil(match.stats.shotsOnTarget[1] * getProgressRatio(match))) : 0)}
-        ${renderStatRow("Fouls Committed", state !== "UPCOMING" ? Math.min(match.stats.fouls[0], Math.ceil(match.stats.fouls[0] * getProgressRatio(match))) : 0, state !== "UPCOMING" ? Math.min(match.stats.fouls[1], Math.ceil(match.stats.fouls[1] * getProgressRatio(match))) : 0)}
-        ${renderStatRow("Corner Kicks", state !== "UPCOMING" ? Math.min(match.stats.corners[0], Math.ceil(match.stats.corners[0] * getProgressRatio(match))) : 0, state !== "UPCOMING" ? Math.min(match.stats.corners[1], Math.ceil(match.stats.corners[1] * getProgressRatio(match))) : 0)}
+        ${renderStatRow("Shots (Total)", match.stats.shots[0], match.stats.shots[1])}
+        ${renderStatRow("Shots on Target", match.stats.shotsOnTarget[0], match.stats.shotsOnTarget[1])}
+        ${renderStatRow("Fouls Committed", match.stats.fouls[0], match.stats.fouls[1])}
+        ${renderStatRow("Corner Kicks", match.stats.corners[0], match.stats.corners[1])}
       </div>
     </div>
     
@@ -645,7 +894,7 @@ function updateModalContent() {
     <div class="tab-content ${activeTab === "lineups" ? "active" : ""}" id="tab-lineups">
       <div class="lineups-container">
         <div class="lineup-team">
-          <div class="lineup-team-title">${match.teamA.name}</div>
+          <div class="lineup-team-title">${teamA.name}</div>
           <ul class="players-list">
             ${match.lineups.teamA.map(p => `
               <li class="player-item">
@@ -658,7 +907,7 @@ function updateModalContent() {
         </div>
         
         <div class="lineup-team">
-          <div class="lineup-team-title team-b">${match.teamB.name}</div>
+          <div class="lineup-team-title team-b">${teamB.name}</div>
           <ul class="players-list">
             ${match.lineups.teamB.map(p => `
               <li class="player-item">
@@ -683,11 +932,11 @@ function updateModalContent() {
             </svg>
             <p>Pre-match lineups and statistics are locked in. The timeline updates as the match starts.</p>
           </div>
-        ` : eventsOccurred.length === 0 ? `
+        ` : match.events.length === 0 ? `
           <div class="no-events">
             <p>Kickoff! The match is underway with no significant events yet.</p>
           </div>
-        ` : eventsOccurred.map(evt => `
+        ` : match.events.map(evt => `
           <div class="timeline-item ${getEventClass(evt.type)}">
             <div class="event-minute">${evt.minute}'</div>
             <div class="event-icon-circle">
@@ -707,13 +956,11 @@ function updateModalContent() {
     </div>
   `;
   
-  // Attach Tab listeners inside modal
   const tabs = modalBodyContent.querySelectorAll(".modal-tab-btn");
   tabs.forEach(btn => {
     btn.addEventListener("click", (e) => {
       const selectedTab = e.target.dataset.tab;
       
-      // Update buttons active class
       tabs.forEach(t => {
         t.classList.remove("active");
         t.setAttribute("aria-selected", "false");
@@ -721,18 +968,10 @@ function updateModalContent() {
       e.target.classList.add("active");
       e.target.setAttribute("aria-selected", "true");
       
-      // Update contents active class
       modalBodyContent.querySelectorAll(".tab-content").forEach(c => c.classList.remove("active"));
       modalBodyContent.querySelector(`#tab-${selectedTab}`).classList.add("active");
     });
   });
-}
-
-function getProgressRatio(match) {
-  const { state, elapsed } = getMatchState(match);
-  if (state === "UPCOMING") return 0;
-  if (state === "FINISHED") return 1;
-  return Math.min(1, elapsed / match.duration);
 }
 
 function renderStatRow(name, valA, valB, suffix = "") {
@@ -774,7 +1013,6 @@ function getEventIcon(type) {
   if (type === "red") {
     return `<div style="width: 10px; height: 14px; background-color: var(--accent-red); border-radius: 2px; box-shadow: 0 0 5px rgba(239, 68, 68, 0.5);"></div>`;
   }
-  // Substitution icon
   return `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="16 3 21 3 21 8"/>
             <line x1="4" y1="20" x2="21" y2="3"/>
@@ -784,10 +1022,8 @@ function getEventIcon(type) {
 
 // 7. Widget Update and Binding Engine
 function updateWidget() {
-  // Render grid matches updates
   renderWidget();
   
-  // Modal details sync if open
   if (modal.open) {
     updateModalContent();
   }
@@ -795,7 +1031,6 @@ function updateWidget() {
 
 // 8. Event Subscriptions & Actions Binding
 function initEvents() {
-  // Layout switch toggle
   toggleLayoutBtn.addEventListener("click", () => {
     if (currentLayout === "horizontal") {
       currentLayout = "vertical";
@@ -807,13 +1042,11 @@ function initEvents() {
       toggleLayoutBtn.classList.remove("active");
     }
     
-    // Notify Electron to resize window
     if (window.electronAPI) {
       window.electronAPI.toggleLayout(currentLayout);
     }
   });
 
-  // Timezone toggle
   toggleTimezoneBtn.addEventListener("click", () => {
     if (activeTimezone === "PST") {
       activeTimezone = "ET";
@@ -825,7 +1058,6 @@ function initEvents() {
     updateWidget();
   });
 
-  // Close modal dialogs
   modalCloseBtn.addEventListener("click", () => {
     modal.close();
     selectedMatchId = null;
@@ -836,20 +1068,38 @@ function initEvents() {
     selectedMatchId = null;
   });
   
-  // ESC key accessibility
   modal.addEventListener("cancel", () => {
     selectedMatchId = null;
   });
 }
 
-// 9. Bootstrap App
-function initApp() {
-  initEvents();
-  updateWidget();
-  
-  // Update Widget state every 10 seconds to detect real-time game state updates
-  setInterval(updateWidget, 10000);
+function updateWidgetDate() {
+  const now = new Date();
+  const options = { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' };
+  widgetDateDisplay.textContent = now.toLocaleDateString('en-US', options);
 }
 
-// Run application on load
+// 9. Bootstrap App
+async function initApp() {
+  initEvents();
+  updateWidgetDate();
+  
+  // Show initial loading state in UI
+  matchesGrid.innerHTML = `
+    <div class="loading-state" style="grid-column: 1 / -1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 40px; color: var(--text-light);">
+      <div class="spinner" style="width: 40px; height: 40px; border: 4px solid rgba(255,255,255,0.1); border-top-color: var(--accent-blue); border-radius: 50%; animation: spin 1s linear infinite; margin-bottom: 16px;"></div>
+      <p>Connecting to live World Cup match center...</p>
+    </div>
+  `;
+  
+  await fetchWorldCupData();
+  updateWidget();
+  
+  // Update state every 30 seconds
+  setInterval(async () => {
+    await fetchWorldCupData();
+    updateWidget();
+  }, 30000);
+}
+
 document.addEventListener("DOMContentLoaded", initApp);
